@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  AI-SSH Wrapper — 启动器
+#  替代 ssh 命令，自动管理 Bridge 生命周期 + 隧道 + Hook 注入
+#  支持 Unix Socket 隧道 + TCP 端口转发降级
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+set -euo pipefail
+
+AI_SSH_DIR="${HOME}/.ai-ssh"
+AI_SSH_CONFIG="${AI_SSH_DIR}/config"
+BRIDGE_PID_FILE="${AI_SSH_DIR}/bridge.pid"
+LOCAL_SOCK="${AI_SSH_DIR}/agent.sock"
+BRIDGE_LOG="${AI_SSH_DIR}/bridge.stderr.log"
+
+# ─── 智能定位 bridge.py ──────────────────────────────────
+# 优先使用安装目录，找不到回退到脚本所在目录（开发模式）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${AI_SSH_DIR}/bridge.py" ]]; then
+    BRIDGE_SCRIPT="${AI_SSH_DIR}/bridge.py"
+elif [[ -f "${SCRIPT_DIR}/bridge.py" ]]; then
+    BRIDGE_SCRIPT="${SCRIPT_DIR}/bridge.py"
+else
+    echo "[ai-ssh] ERROR: bridge.py not found" >&2
+    echo "  尝试运行 install.sh 安装，或确保 bridge.py 在同目录下" >&2
+    exit 1
+fi
+
+# ─── 加载配置 ─────────────────────────────────────────────
+AI_TOOL="gemini"
+VERBOSE="false"
+if [[ -f "$AI_SSH_CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$AI_SSH_CONFIG"
+fi
+
+_log() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [aissh] $*" >> "${AI_SSH_DIR}/wrapper.log"
+    fi
+}
+
+# ─── 显示用法 ─────────────────────────────────────────────
+usage() {
+    cat <<'USAGE'
+Usage: aissh [ssh options] [user@]hostname
+
+AI-SSH Wrapper — 自动为 SSH 会话附加 AI 辅助能力
+自动完成以下操作：
+  1. 后台启动 Bridge 微服务 (Unix Socket + TCP)
+  2. 建立反向隧道 (优先 Socket, 降级 TCP)
+  3. 在远程注入 Shell Hook（Ctrl+G / Ctrl+B）
+  4. SSH 退出时自动清理 Bridge
+
+示例:
+  aissh root@myserver
+  aissh -p 2222 user@server
+  aissh -i ~/.ssh/key user@host
+
+USAGE
+    exit 0
+}
+
+# 无参数时显示帮助
+[[ $# -eq 0 ]] && usage
+
+# ─── 生成动态路径和端口 ──────────────────────────────────
+# 随机后缀避免 StreamLocalBindUnlink=no 导致的绑定冲突
+AISSH_RAND="$(date +%s)-$$"
+REMOTE_SOCK="/tmp/aissh-${AISSH_RAND}.sock"
+
+# TCP 降级端口：从 49152-65535 (动态端口范围) 中随机选一个
+TCP_PORT=$(( (RANDOM % 16383) + 49152 ))
+REMOTE_TCP_PORT="${TCP_PORT}"
+
+# 确保配置目录存在
+mkdir -p "$AI_SSH_DIR"
+
+# ─── 启动 Bridge ─────────────────────────────────────────
+_start_bridge() {
+    # 检查是否已有 Bridge 运行
+    if [[ -f "$BRIDGE_PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$BRIDGE_PID_FILE")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            _log "Bridge already running (PID=$old_pid), killing it for fresh start"
+            kill "$old_pid" 2>/dev/null || true
+            sleep 0.2
+            kill -9 "$old_pid" 2>/dev/null || true
+        fi
+    fi
+
+    # 清理残留 socket
+    [[ -S "$LOCAL_SOCK" ]] && rm -f "$LOCAL_SOCK"
+
+    _log "Starting Bridge (sock=${LOCAL_SOCK}, tcp=127.0.0.1:${TCP_PORT})..."
+    _log "Bridge script: ${BRIDGE_SCRIPT}"
+    # stderr 写入日志文件，方便排错
+    nohup python3 "$BRIDGE_SCRIPT" "$LOCAL_SOCK" --tcp-port "$TCP_PORT" > /dev/null 2>"$BRIDGE_LOG" &
+    local bridge_pid=$!
+    echo "$bridge_pid" > "$BRIDGE_PID_FILE"
+    _log "Bridge started (PID=$bridge_pid)"
+
+    # 等待 socket 就绪（最多 5 秒）
+    local wait_count=0
+    while [[ ! -S "$LOCAL_SOCK" ]] && [[ $wait_count -lt 50 ]]; do
+        # 检查进程是否还活着
+        if ! kill -0 "$bridge_pid" 2>/dev/null; then
+            echo "[ai-ssh] ERROR: Bridge process crashed during startup" >&2
+            if [[ -f "$BRIDGE_LOG" ]]; then
+                echo "  Bridge 错误日志:" >&2
+                tail -5 "$BRIDGE_LOG" >&2
+            fi
+            rm -f "$BRIDGE_PID_FILE"
+            exit 1
+        fi
+        sleep 0.1
+        ((wait_count++))
+    done
+
+    if [[ ! -S "$LOCAL_SOCK" ]]; then
+        echo "[ai-ssh] ERROR: Bridge started but socket not ready (timeout 5s)" >&2
+        if [[ -f "$BRIDGE_LOG" ]]; then
+            echo "  Bridge 错误日志:" >&2
+            tail -5 "$BRIDGE_LOG" >&2
+        fi
+        kill "$bridge_pid" 2>/dev/null || true
+        rm -f "$BRIDGE_PID_FILE"
+        exit 1
+    fi
+}
+
+# ─── 停止 Bridge ─────────────────────────────────────────
+_stop_bridge() {
+    if [[ -f "$BRIDGE_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$BRIDGE_PID_FILE")
+        _log "Stopping Bridge (PID=$pid)..."
+        kill "$pid" 2>/dev/null || true
+        sleep 0.2
+        kill -9 "$pid" 2>/dev/null || true
+        rm -f "$BRIDGE_PID_FILE"
+    fi
+    [[ -S "$LOCAL_SOCK" ]] && rm -f "$LOCAL_SOCK"
+    _log "Bridge stopped"
+}
+
+# ─── 构建远程注入脚本 ────────────────────────────────────
+_build_remote_init() {
+    # 远程 Shell Hook：自动检测 Socket 或 TCP 降级
+    cat <<'REMOTE_HOOK'
+# ── AI-SSH Remote Hook ──────────────────────────────────
+export AI_SSH_REMOTE_SOCK="__REMOTE_SOCK__"
+export AI_SSH_TCP_PORT="__TCP_PORT__"
+
+# 智能发送：优先 Unix Socket 隧道，降级 TCP
+_aissh_send_request() {
+    local json_payload="$1"
+    local result=""
+
+    if [[ -S "${AI_SSH_REMOTE_SOCK}" ]]; then
+        result=$(curl -s --unix-socket "${AI_SSH_REMOTE_SOCK}" \
+            -X POST -H "Content-Type: application/json" \
+            -d "$json_payload" \
+            "http://localhost/generate" 2>/dev/null)
+    fi
+
+    if [[ -z "$result" ]] && [[ -n "${AI_SSH_TCP_PORT}" ]]; then
+        result=$(curl -s \
+            -X POST -H "Content-Type: application/json" \
+            -d "$json_payload" \
+            "http://127.0.0.1:${AI_SSH_TCP_PORT}/generate" 2>/dev/null)
+    fi
+    echo "$result"
+}
+
+_aissh_remote_call() {
+    local user_input="$1"
+    local fetch_clipboard="${2:-false}"
+    local os_info; os_info="$(uname -a 2>/dev/null)"
+    local pwd_info; pwd_info="$(pwd)"
+    local env_info; env_info="PATH=${PATH}"
+    
+    # 优雅方案：直接作为参数传给 Python，Shell 自动处理转义，不污染环境变量
+    local json_payload
+    json_payload=$(python3 -c 'import json, sys; print(json.dumps({
+        "user_input": sys.argv[1],
+        "os_info": sys.argv[2],
+        "pwd": sys.argv[3],
+        "env_vars": sys.argv[4],
+        "fetch_clipboard": sys.argv[5].lower() == "true"
+    }))' "$user_input" "$os_info" "$pwd_info" "$env_info" "$fetch_clipboard")
+
+    local raw_result
+    raw_result=$(_aissh_send_request "$json_payload")
+    local result
+    result=$(echo "$raw_result" | \
+        python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("command",""))' 2>/dev/null)
+    # 清理 markdown 标记并限制行数
+    result=$(echo "$result" | sed 's/^```[a-z]*//;s/^```//;s/```$//' | sed '/^$/d' | head -n 1)
+    echo "$result" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    _aissh_gen_w() {
+        local i="$BUFFER"
+        [[ -z "$i" ]] && { zle -M "[ai-ssh] 请先输入自然语言描述"; return; }
+        zle -R "[ai-ssh] 正在思考..."
+        local c; c="$(_aissh_remote_call "$i")"
+        if [[ -n "$c" ]]; then 
+            # 将原输入变为注释并保留，新起一行放命令
+            BUFFER="# ${i}
+${c}"
+            CURSOR=${#BUFFER}
+        else 
+            zle -M "[ai-ssh] 未能获取命令"
+        fi
+        zle reset-prompt
+    }
+    _aissh_buf_w() {
+        local i="$BUFFER"
+        [[ -z "$i" ]] && { zle -M "[ai-ssh] 请先输入自然语言描述"; return; }
+        zle -R "[ai-ssh] 正在思考（含剪贴板）..."
+        local c; c="$(_aissh_remote_call "$i" "true")"
+        if [[ -n "$c" ]]; then 
+            BUFFER="# ${i}
+${c}"
+            CURSOR=${#BUFFER}
+        else 
+            zle -M "[ai-ssh] 未能获取命令"
+        fi
+        zle reset-prompt
+    }
+    zle -N _aissh_gen_w; bindkey '^G' _aissh_gen_w
+    zle -N _aissh_buf_w; bindkey '^B' _aissh_buf_w
+elif [[ -n "${BASH_VERSION:-}" ]]; then
+    _aissh_gen_b() {
+        local i="${READLINE_LINE}"
+        [[ -z "$i" ]] && { echo "[ai-ssh] 请先输入自然语言描述"; return; }
+        echo -ne "\r\033[K[ai-ssh] 正在思考..."
+        local c; c="$(_aissh_remote_call "$i")"
+        echo -ne "\r\033[K"
+        if [[ -n "$c" ]]; then 
+            READLINE_LINE="# ${i}
+${c}"
+            READLINE_POINT=${#READLINE_LINE}
+        fi
+    }
+    _aissh_buf_b() {
+        local i="${READLINE_LINE}"
+        [[ -z "$i" ]] && { echo "[ai-ssh] 请先输入自然语言描述"; return; }
+        echo -ne "\r\033[K[ai-ssh] 正在思考（含剪贴板）..."
+        local c; c="$(_aissh_remote_call "$i" "true")"
+        echo -ne "\r\033[K"
+        if [[ -n "$c" ]]; then 
+            READLINE_LINE="# ${i}
+${c}"
+            READLINE_POINT=${#READLINE_LINE}
+        fi
+    }
+    bind -x '"\C-g": _aissh_gen_b'
+    bind -x '"\C-b": _aissh_buf_b'
+fi
+# ── End AI-SSH Remote Hook ──────────────────────────────
+REMOTE_HOOK
+}
+
+# ─── 主逻辑 ──────────────────────────────────────────────
+
+# 1. 启动 Bridge (同时监听 Unix Socket + TCP)
+_start_bridge
+
+# 2. 设置清理 trap — SSH 退出时关闭 Bridge
+trap '_stop_bridge' EXIT INT TERM
+
+# 3. 构建远程初始化脚本，替换占位符
+REMOTE_INIT=$(_build_remote_init | \
+    sed "s|__REMOTE_SOCK__|${REMOTE_SOCK}|g" | \
+    sed "s|__TCP_PORT__|${REMOTE_TCP_PORT}|g")
+
+# 4. Base64 编码远程脚本，避免 shell 引号嵌套问题
+REMOTE_INIT_B64=$(printf '%s' "$REMOTE_INIT" | base64 | tr -d '\n')
+
+# 5. 建立 SSH 连接
+#    流程：base64 解码 hook → 写入临时文件 → 通过 --rcfile 在交互式 shell 中 source
+#    这样 bind -x / zle 在交互式上下文中执行，热键才能生效
+_log "Connecting SSH with tunnel: sock=${REMOTE_SOCK}, tcp=${REMOTE_TCP_PORT}"
+
+ssh \
+    -R "${REMOTE_SOCK}:${LOCAL_SOCK}" \
+    -R "127.0.0.1:${REMOTE_TCP_PORT}:127.0.0.1:${TCP_PORT}" \
+    -t \
+    -o "ExitOnForwardFailure=no" \
+    -o "PermitLocalCommand=no" \
+    "$@" \
+    "_F=/tmp/aissh-\$\$.sh; echo '${REMOTE_INIT_B64}' | base64 -d > \$_F; case \$(basename \${SHELL:-bash}) in zsh) _Z=\$(mktemp -d /tmp/aissh-zd-XXXXXX); { [ -f ~/.zshrc ] && cat ~/.zshrc; echo \". \$_F\"; } > \$_Z/.zshrc; ZDOTDIR=\$_Z exec zsh -i;; *) _R=/tmp/aissh-rc-\$\$.sh; printf '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n[ -f ~/.bashrc ] && . ~/.bashrc\n. %s\n' \$_F > \$_R; exec bash --rcfile \$_R -i;; esac"
+
+_log "SSH session ended"

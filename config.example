@@ -1,0 +1,20 @@
+# AI-SSH Configuration
+# Copy this file to ~/.ai-ssh/config
+
+# ─── AI 引擎选择 ─────────────────────────────────────
+# 内置适配器: gemini, kimi, claude, claude-code
+# 设置为工具名即可，无需额外配置
+AI_TOOL="gemini"
+
+# ─── 自定义工具适配（仅当 AI_TOOL 不在内置列表时生效）─
+# 自定义 CLI 参数，追加在 AI_TOOL 后面
+# 示例: AI_ARGS="--print --prompt"  →  mytool --print --prompt "..."
+# AI_ARGS=""
+
+# 自定义输出解析正则（提取第一个捕获组）
+# 示例: AI_PARSE_RE="TextPart\(type='text', text='(.*?)'\)"
+# AI_PARSE_RE=""
+
+# ─── 调试 ────────────────────────────────────────────
+# 开启详细日志（写入 ~/.ai-ssh/*.log）
+VERBOSE=false

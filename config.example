@@ -2,9 +2,16 @@
 # Copy this file to ~/.ai-ssh/config
 
 # ─── AI 引擎选择 ─────────────────────────────────────
-# 内置适配器: gemini, kimi, claude, claude-code
+# 内置适配器: gemini-cli, kimi-cli, claude-code, openai
 # 设置为工具名即可，无需额外配置
 AI_TOOL="gemini"
+
+# ─── OpenAI 兼容 API 直连（AI_TOOL="openai" 时生效）──
+# 适用于: 有 API Key 的用户，或使用 DeepSeek/Google AI Studio 等兼容服务
+# 无需安装任何 CLI 工具，仅使用 Python 标准库请求
+# OPENAI_API_BASE="https://api.openai.com/v1"
+# OPENAI_API_KEY="sk-your-api-key-here"
+# OPENAI_MODEL="gpt-4o"
 
 # ─── 自定义工具适配（仅当 AI_TOOL 不在内置列表时生效）─
 # 自定义 CLI 参数，追加在 AI_TOOL 后面

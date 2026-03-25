@@ -75,11 +75,60 @@ _aissh_invoke_tool() {
     local raw_output=""
 
     case "$tool" in
+        openai)
+            # OpenAI 兼容 API 直连：使用 curl + python3 构造/解析 JSON
+            local api_base="${OPENAI_API_BASE:-https://api.openai.com/v1}"
+            api_base="${api_base%/}"
+            local api_key="${OPENAI_API_KEY:-}"
+            local model="${OPENAI_MODEL:-gpt-4o}"
+
+            if [[ -z "$api_key" ]]; then
+                echo "Error: OPENAI_API_KEY not set in ~/.ai-ssh/config"
+                return
+            fi
+
+            local api_payload
+            api_payload=$(python3 -c 'import json,sys
+data = {
+    "model": sys.argv[1],
+    "messages": [{"role": "user", "content": sys.argv[2]}],
+}
+if sys.argv[3]:
+    data["temperature"] = float(sys.argv[3])
+print(json.dumps(data))
+' "$model" "$prompt" "${OPENAI_TEMPERATURE:-}")
+
+            _aissh_log "OPENAI_API_BASE: ${api_base}"
+            _aissh_log "OPENAI_MODEL: ${model}"
+            _aissh_log "OPENAI_PAYLOAD: $api_payload"
+
+            raw_output=$(curl -s "${api_base}/chat/completions" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${api_key}" \
+                -d "$api_payload")
+
+            _aissh_log "OPENAI_RESPONSE: $raw_output"
+
+            printf "%s" "$raw_output" | python3 -c '
+import json,sys
+try:
+    # 强制将输入按 UTF-8 解码，忽略错误
+    data=json.load(sys.stdin)
+    if "error" in data:
+        err = data["error"]
+        msg = err.get("message", str(err))
+        print(f"[API Error]: {msg}")
+    else:
+        print(data["choices"][0]["message"]["content"])
+except Exception as e:
+    print(f"[Parse Error]: {str(e)}")
+' 
+            ;;
         kimi)
             raw_output=$("$tool" --quiet --prompt "$prompt" 2>/dev/null)
             echo "$raw_output"
             ;;
-        claude|claude-code)
+        claude)
             raw_output=$("$tool" --print --prompt "$prompt" 2>/dev/null)
             echo "$raw_output"
             ;;

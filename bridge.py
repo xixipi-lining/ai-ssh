@@ -122,11 +122,62 @@ def build_prompt(payload):
     prompt = re.sub(r'\n{3,}', '\n\n', prompt).strip()
     return prompt
 
+def call_openai_api(prompt):
+    """通过 OpenAI 兼容 API 直连调用 (仅使用 Python 标准库 urllib, 无需 SDK)"""
+    import urllib.request
+    import urllib.error
+
+    api_base = CONFIG.get("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+    api_key = CONFIG.get("OPENAI_API_KEY", "")
+    model = CONFIG.get("OPENAI_MODEL", "gpt-4o")
+
+    if not api_key:
+        return "Error: OPENAI_API_KEY not set in ~/.ai-ssh/config"
+
+    url = f"{api_base}/chat/completions"
+    data_dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    temp = CONFIG.get("OPENAI_TEMPERATURE")
+    if temp:
+        try:
+            data_dict["temperature"] = float(temp)
+        except ValueError:
+            pass
+
+    payload = json.dumps(data_dict).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {api_key}")
+
+    log(f"OpenAI API -> {url} (model={model})")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        log(f"OpenAI API error {e.code}: {error_body}")
+        return f"Error: OpenAI API returned {e.code}: {error_body}"
+    except urllib.error.URLError as e:
+        return f"Error: Failed to connect to OpenAI API: {e.reason}"
+    except (KeyError, IndexError):
+        return "Error: Unexpected response format from OpenAI API"
+    except Exception as e:
+        return f"Error: {e}"
+
 def call_ai(prompt):
     """通过适配器调用配置的 AI 引擎"""
     tool = CONFIG.get("AI_TOOL", "gemini")
 
-    # ─── 内置适配器注册表 ────────────────────────────────
+    # ─── OpenAI API 直连模式 (无需 CLI 工具) ────────────
+    if tool == "openai":
+        return call_openai_api(prompt)
+
+    # ─── 内置 CLI 适配器注册表 ──────────────────────────
     # 每个适配器定义: cmd_args(额外命令行参数), parse(输出解析函数)
     ADAPTERS = {
         "gemini": {
@@ -138,10 +189,6 @@ def call_ai(prompt):
             "parse": lambda out: out.strip(),
         },
         "claude": {
-            "cmd": lambda t, p: [t, "--print", "--prompt", p],
-            "parse": lambda out: out.strip(),
-        },
-        "claude-code": {
             "cmd": lambda t, p: [t, "--print", "--prompt", p],
             "parse": lambda out: out.strip(),
         },

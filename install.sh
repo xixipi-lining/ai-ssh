@@ -40,6 +40,10 @@ cp "${SCRIPT_DIR}/aissh"      "${INSTALL_DIR}/aissh"
 chmod +x "${INSTALL_DIR}/aissh"
 ok "SSH Wrapper   -> ${INSTALL_DIR}/aissh"
 
+cp "${SCRIPT_DIR}/prompt.tmpl" "${INSTALL_DIR}/prompt.tmpl"
+ok "Prompt 模板   -> ${INSTALL_DIR}/prompt.tmpl"
+
+
 # ─── 3. 配置文件（不覆盖已有配置）────────────────────────
 if [[ ! -f "${INSTALL_DIR}/config" ]]; then
     cp "${SCRIPT_DIR}/config.example" "${INSTALL_DIR}/config"

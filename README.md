@@ -15,7 +15,7 @@
 ## 📦 安装
 
 ```bash
-git clone <repo-url> && cd aissh-v2
+git clone https://github.com/xixipi-lining/aissh.git && cd aissh
 bash install.sh
 ```
 
@@ -65,6 +65,7 @@ root@myserver:~$ exit           # Bridge 自动清理
 ├── config          # 全局配置
 ├── hook.sh         # Shell 热键劫持 (Zsh/Bash)
 ├── bridge.py       # 伴生微服务 (Socket + TCP 双监听)
+├── prompt.tmpl     # AI 提示词模板
 └── aissh           # SSH 包装器 (生命周期管理)
 ```
 
@@ -73,6 +74,7 @@ root@myserver:~$ exit           # Bridge 自动清理
 | `hook.sh` | 快捷键劫持 + 上下文采集 + AI 适配器 | Zsh `zle` / Bash `bind -x` |
 | `bridge.py` | 伴生微服务，Socket + TCP 双通道 | Python `http.server` + `threading` |
 | `aissh` | SSH 包装，双隧道 + Bridge 生命周期 | Bash + `trap` |
+| `prompt.tmpl`| AI 上下文组装生成模板 | 占位符替换引擎 |
 
 ## 📋 依赖
 

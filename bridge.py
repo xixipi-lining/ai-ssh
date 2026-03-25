@@ -99,6 +99,68 @@ def get_local_clipboard():
         log(f"Error getting local clipboard: {e}")
         return ""
 
+def prompt_local_input():
+    """Open a native OS dialog to get user input locally (zero network latency).
+    macOS: osascript (AppleScript), Linux: zenity/kdialog/tty fallback.
+    """
+    if sys.platform == "darwin":
+        return _prompt_macos()
+    else:
+        return _prompt_linux()
+
+def _prompt_macos():
+    """macOS: use osascript for a native dialog. Enter submits, Option+Return for newline."""
+    script = (
+        'try\n'
+        '    set theResult to text returned of (display dialog '
+        '"输入自然语言请求" & return & "(⏎ 发送  |  ⌥⏎ 换行)" '
+        'default answer "" '
+        'with title "🚀 AI-SSH" '
+        'buttons {"取消", "发送"} default button "发送" '
+        'giving up after 300)\n'
+        '    return theResult\n'
+        'on error number -128\n'
+        '    return ""\n'
+        'end try'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=310
+        )
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        log("Local input dialog timed out")
+        return ""
+    except Exception as e:
+        log(f"Local input dialog error: {e}")
+        return ""
+
+def _prompt_linux():
+    """Linux: try zenity, then kdialog, then /dev/tty as fallback."""
+    for cmd_args in [
+        ["zenity", "--entry", "--title=AI-SSH", "--text=输入自然语言请求 (Enter 发送):", "--width=500"],
+        ["kdialog", "--inputbox", "输入自然语言请求 (Enter 发送):"],
+    ]:
+        try:
+            result = subprocess.run(cmd_args, capture_output=True, text=True, timeout=310)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return ""
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            return ""
+    # Last resort: /dev/tty
+    try:
+        with open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
+            tty_out.write("\033[1;36m[ai-ssh]\033[0m 输入自然语言请求 (Enter 发送):\n> ")
+            tty_out.flush()
+            return tty_in.readline().strip()
+    except Exception as e:
+        log(f"TTY fallback failed: {e}")
+        return ""
+
 def build_prompt(payload):
     """使用模板组装提示词"""
     tmpl = load_prompt_template()
@@ -244,15 +306,30 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             payload = json.loads(body)
-            # 💡 核心修复：如果请求要求获取本地剪贴板，则在本地 Bridge 中抓取
-            if payload.get("fetch_clipboard") is True:
-                log("Fetching local clipboard for remote request...")
-                payload["clipboard_data"] = get_local_clipboard()
         except json.JSONDecodeError:
             self.send_response(400)
             self.end_headers()
             self.wfile.write(b'{"error":"invalid json"}')
             return
+
+        # 🆕 本地输入模式：远端空 BUFFER 时弹出本地弹框采集输入
+        if payload.get("action") == "prompt_local":
+            log("Action: prompt_local — opening local input dialog")
+            user_input = prompt_local_input()
+            if not user_input:
+                log("Local input cancelled or empty")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"command": ""}).encode("utf-8"))
+                return
+            payload["user_input"] = user_input
+            log(f"Local input received: {user_input}")
+
+        # 💡 如果请求要求获取本地剪贴板，则在本地 Bridge 中抓取
+        if payload.get("fetch_clipboard") is True:
+            log("Fetching local clipboard for remote request...")
+            payload["clipboard_data"] = get_local_clipboard()
 
         prompt = build_prompt(payload)
         log(f"PROMPT: {prompt}")

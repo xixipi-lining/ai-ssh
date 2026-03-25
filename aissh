@@ -200,14 +200,47 @@ _aissh_remote_call() {
     echo "$result" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+# 🆕 本地输入模式：通过隧道让本地 Bridge 弹出原生对话框采集输入
+_aissh_local_prompt() {
+    local fetch_clipboard="${1:-false}"
+    local os_info; os_info="$(uname -a 2>/dev/null)"
+    local pwd_info; pwd_info="$(pwd)"
+    local env_info; env_info="PATH=${PATH}"
+    local json_payload
+    json_payload=$(python3 -c 'import json, sys; print(json.dumps({
+        "action": "prompt_local",
+        "os_info": sys.argv[1],
+        "pwd": sys.argv[2],
+        "env_vars": sys.argv[3],
+        "fetch_clipboard": sys.argv[4].lower() == "true"
+    }))' "$os_info" "$pwd_info" "$env_info" "$fetch_clipboard")
+    local raw_result
+    raw_result=$(_aissh_send_request "$json_payload")
+    local result
+    result=$(echo "$raw_result" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("command",""))' 2>/dev/null)
+    result=$(echo "$result" | sed 's/^```[a-z]*//;s/^```//;s/```$//' | sed '/^$/d' | head -n 1)
+    echo "$result" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
 if [[ -n "${ZSH_VERSION:-}" ]]; then
     _aissh_gen_w() {
         local i="$BUFFER"
-        [[ -z "$i" ]] && { zle -M "[ai-ssh] 请先输入自然语言描述"; return; }
+        if [[ -z "$i" ]]; then
+            # 空 BUFFER → 触发本地输入弹框（零延迟输入）
+            zle -R "[ai-ssh] 请在本地输入框中输入..."
+            local c; c="$(_aissh_local_prompt)"
+            if [[ -n "$c" ]]; then
+                BUFFER="$c"
+                CURSOR=${#BUFFER}
+            else
+                zle -M "[ai-ssh] 已取消"
+            fi
+            zle reset-prompt
+            return
+        fi
         zle -R "[ai-ssh] 正在思考..."
         local c; c="$(_aissh_remote_call "$i")"
         if [[ -n "$c" ]]; then 
-            # 将原输入变为注释并保留，新起一行放命令
             BUFFER="# ${i}
 ${c}"
             CURSOR=${#BUFFER}
@@ -218,7 +251,18 @@ ${c}"
     }
     _aissh_buf_w() {
         local i="$BUFFER"
-        [[ -z "$i" ]] && { zle -M "[ai-ssh] 请先输入自然语言描述"; return; }
+        if [[ -z "$i" ]]; then
+            zle -R "[ai-ssh] 请在本地输入框中输入（含剪贴板）..."
+            local c; c="$(_aissh_local_prompt "true")"
+            if [[ -n "$c" ]]; then
+                BUFFER="$c"
+                CURSOR=${#BUFFER}
+            else
+                zle -M "[ai-ssh] 已取消"
+            fi
+            zle reset-prompt
+            return
+        fi
         zle -R "[ai-ssh] 正在思考（含剪贴板）..."
         local c; c="$(_aissh_remote_call "$i" "true")"
         if [[ -n "$c" ]]; then 
@@ -235,7 +279,16 @@ ${c}"
 elif [[ -n "${BASH_VERSION:-}" ]]; then
     _aissh_gen_b() {
         local i="${READLINE_LINE}"
-        [[ -z "$i" ]] && { echo "[ai-ssh] 请先输入自然语言描述"; return; }
+        if [[ -z "$i" ]]; then
+            echo -ne "\r\033[K[ai-ssh] 请在本地输入框中输入..."
+            local c; c="$(_aissh_local_prompt)"
+            echo -ne "\r\033[K"
+            if [[ -n "$c" ]]; then
+                READLINE_LINE="$c"
+                READLINE_POINT=${#READLINE_LINE}
+            fi
+            return
+        fi
         echo -ne "\r\033[K[ai-ssh] 正在思考..."
         local c; c="$(_aissh_remote_call "$i")"
         echo -ne "\r\033[K"
@@ -247,7 +300,16 @@ ${c}"
     }
     _aissh_buf_b() {
         local i="${READLINE_LINE}"
-        [[ -z "$i" ]] && { echo "[ai-ssh] 请先输入自然语言描述"; return; }
+        if [[ -z "$i" ]]; then
+            echo -ne "\r\033[K[ai-ssh] 请在本地输入框中输入（含剪贴板）..."
+            local c; c="$(_aissh_local_prompt "true")"
+            echo -ne "\r\033[K"
+            if [[ -n "$c" ]]; then
+                READLINE_LINE="$c"
+                READLINE_POINT=${#READLINE_LINE}
+            fi
+            return
+        fi
         echo -ne "\r\033[K[ai-ssh] 正在思考（含剪贴板）..."
         local c; c="$(_aissh_remote_call "$i" "true")"
         echo -ne "\r\033[K"

@@ -81,3 +81,7 @@ root@myserver:~$ exit           # Bridge 自动清理
 - Python 3（Bridge + JSON 编码）
 - curl（远程模式 Hook 发送请求）
 - 一个 AI CLI 工具（内置支持 `gemini`、`kimi`、`claude`）
+
+## 📄 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。

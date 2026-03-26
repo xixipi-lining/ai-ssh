@@ -231,20 +231,72 @@ _aissh_call_ai() {
     echo "$result"
 }
 
+# ─── 本地弹框输入（远程零延迟模式）─────────────────────────
+# 远程模式下空 BUFFER 时，通过隧道让本地 Bridge 弹出原生对话框采集输入
+_aissh_local_prompt() {
+    local fetch_clipboard="${1:-false}"
+    local os_info pwd_info env_info
+    os_info="$(uname -a 2>/dev/null)"
+    pwd_info="$(pwd)"
+    env_info="PATH=${PATH}"
+
+    local json_payload
+    json_payload=$(python3 -c 'import json, sys; print(json.dumps({
+        "action": "prompt_local",
+        "os_info": sys.argv[1],
+        "pwd": sys.argv[2],
+        "env_vars": sys.argv[3],
+        "fetch_clipboard": sys.argv[4].lower() == "true"
+    }))' "$os_info" "$pwd_info" "$env_info" "$fetch_clipboard")
+
+    local result=""
+    # 优先 Socket，降级 TCP（复用已有隧道）
+    if [[ -S "${AI_SSH_REMOTE_SOCK}" ]]; then
+        result=$(curl -s --unix-socket "${AI_SSH_REMOTE_SOCK}" \
+            -X POST -H "Content-Type: application/json" \
+            -d "$json_payload" \
+            "http://localhost/generate" 2>/dev/null)
+    fi
+    if [[ -z "$result" ]] && [[ -n "${AI_SSH_TCP_PORT:-}" ]]; then
+        result=$(curl -s \
+            -X POST -H "Content-Type: application/json" \
+            -d "$json_payload" \
+            "http://127.0.0.1:${AI_SSH_TCP_PORT}/generate" 2>/dev/null)
+    fi
+
+    local cmd
+    cmd=$(echo "$result" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("command",""))' 2>/dev/null)
+    cmd=$(echo "$cmd" | sed 's/^```[a-z]*//;s/^```//;s/```$//' | sed '/^$/d' | head -n 1)
+    echo "$cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Zsh 绑定 (zle widgets)
-#  修复：使用 zle -R 立即刷新提示，完成后清除消息
+#  空 BUFFER + 远程模式 → 零延迟本地弹框
+#  有内容 → 原位替换（原模式）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if [[ -n "${ZSH_VERSION:-}" ]]; then
 
-    # Ctrl+G: Generate — 仅当前行
+    # Ctrl+G: Generate
     _aissh_generate_widget() {
         local user_input="$BUFFER"
         if [[ -z "$user_input" ]]; then
+            if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
+                # 远程模式：空 BUFFER → 本地弹框
+                zle -R "[ai-ssh] 请在本地输入框中输入..."
+                local cmd; cmd="$(_aissh_local_prompt)"
+                if [[ -n "$cmd" ]]; then
+                    BUFFER="$cmd"
+                    CURSOR=${#BUFFER}
+                else
+                    zle -M "[ai-ssh] 已取消"
+                fi
+                zle reset-prompt
+                return
+            fi
             zle -M "[ai-ssh] 请先输入自然语言描述"
             return
         fi
-        # 先显示提示，立即刷新屏幕
         zle -R "[ai-ssh] 正在思考..."
         local cmd
         cmd="$(_aissh_call_ai "$user_input")"
@@ -264,6 +316,18 @@ ${cmd}"
     _aissh_buffer_widget() {
         local user_input="$BUFFER"
         if [[ -z "$user_input" ]]; then
+            if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
+                zle -R "[ai-ssh] 请在本地输入框中输入（含剪贴板）..."
+                local cmd; cmd="$(_aissh_local_prompt "true")"
+                if [[ -n "$cmd" ]]; then
+                    BUFFER="$cmd"
+                    CURSOR=${#BUFFER}
+                else
+                    zle -M "[ai-ssh] 已取消"
+                fi
+                zle reset-prompt
+                return
+            fi
             zle -M "[ai-ssh] 请先输入自然语言描述"
             return
         fi
@@ -272,10 +336,8 @@ ${cmd}"
         local clipboard=""
         local fetch_local="false"
         if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
-            # 远程模式下，让 Bridge 获取本地剪贴板
             fetch_local="true"
         else
-            # 本地模式，直接获取
             clipboard="$(_aissh_get_clipboard)"
         fi
 
@@ -298,10 +360,20 @@ ${cmd}"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 elif [[ -n "${BASH_VERSION:-}" ]]; then
 
-    # Ctrl+G: Generate — 仅当前行
+    # Ctrl+G: Generate
     _aissh_generate_bash() {
         local user_input="${READLINE_LINE}"
         if [[ -z "$user_input" ]]; then
+            if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
+                echo -ne "\r\033[K[ai-ssh] 请在本地输入框中输入..."
+                local cmd; cmd="$(_aissh_local_prompt)"
+                echo -ne "\r\033[K"
+                if [[ -n "$cmd" ]]; then
+                    READLINE_LINE="$cmd"
+                    READLINE_POINT=${#READLINE_LINE}
+                fi
+                return
+            fi
             echo "[ai-ssh] 请先输入自然语言描述"
             return
         fi
@@ -321,6 +393,16 @@ ${cmd}"
     _aissh_buffer_bash() {
         local user_input="${READLINE_LINE}"
         if [[ -z "$user_input" ]]; then
+            if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
+                echo -ne "\r\033[K[ai-ssh] 请在本地输入框中输入（含剪贴板）..."
+                local cmd; cmd="$(_aissh_local_prompt "true")"
+                echo -ne "\r\033[K"
+                if [[ -n "$cmd" ]]; then
+                    READLINE_LINE="$cmd"
+                    READLINE_POINT=${#READLINE_LINE}
+                fi
+                return
+            fi
             echo "[ai-ssh] 请先输入自然语言描述"
             return
         fi

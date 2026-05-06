@@ -270,10 +270,31 @@ _aissh_local_prompt() {
     echo "$cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+# ─── 本地弹框输入逻辑 ─────────────────────────────────────
+_aissh_get_native_input() {
+    local prompt_text="${1:-输入自然语言请求}"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        local script="try
+    set theResult to text returned of (display dialog \"$prompt_text\" & return & \"(⏎ 发送  |  ⌥⏎ 换行)\" default answer \"\" with title \"🚀 AI-SSH\" buttons {\"取消\", \"发送\"} default button \"发送\" giving up after 300)
+    return theResult
+on error number -128
+    return \"\"
+end try"
+        osascript -e "$script" 2>/dev/null
+    else
+        # Linux fallback: zenity -> kdialog -> read
+        if command -v zenity &>/dev/null; then
+            zenity --entry --title="AI-SSH" --text="$prompt_text (Enter 发送):" --width=500 2>/dev/null
+        elif command -v kdialog &>/dev/null; then
+            kdialog --inputbox "$prompt_text (Enter 发送):" 2>/dev/null
+        else
+            return 1
+        fi
+    fi
+}
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Zsh 绑定 (zle widgets)
-#  空 BUFFER + 远程模式 → 零延迟本地弹框
-#  有内容 → 原位替换（原模式）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if [[ -n "${ZSH_VERSION:-}" ]]; then
 
@@ -281,33 +302,42 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
     _aissh_generate_widget() {
         local user_input="$BUFFER"
         if [[ -z "$user_input" ]]; then
+            # 空 BUFFER → 触发本地输入弹框
+            local cmd=""
             if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
-                # 远程模式：空 BUFFER → 本地弹框
-                zle -R "[ai-ssh] 请在本地输入框中输入..."
-                local cmd; cmd="$(_aissh_local_prompt)"
-                if [[ -n "$cmd" ]]; then
-                    BUFFER="$cmd"
-                    CURSOR=${#BUFFER}
-                else
-                    zle -M "[ai-ssh] 已取消"
-                fi
-                zle reset-prompt
-                return
+                zle -M "[ai-ssh] 请在本地输入框中输入..."
+                cmd="$(_aissh_local_prompt)"
+            else
+                local native_input; native_input="$(_aissh_get_native_input)"
+                [[ -z "$native_input" ]] && { zle -M "[ai-ssh] 已取消"; zle redisplay; return; }
+                user_input="$native_input"
+                zle -M "[ai-ssh] 正在思考..."
+                cmd="$(_aissh_call_ai "$user_input")"
             fi
-            zle -M "[ai-ssh] 请先输入自然语言描述"
+            
+            if [[ -n "$cmd" ]]; then
+                BUFFER="# ${user_input}
+${cmd}"
+                CURSOR=${#BUFFER}
+            else
+                zle -M "[ai-ssh] 未能获取命令"
+            fi
+            zle redisplay
             return
         fi
-        zle -R "[ai-ssh] 正在思考..."
+
+        zle -M "[ai-ssh] 正在思考..."
         local cmd
         cmd="$(_aissh_call_ai "$user_input")"
         if [[ -n "$cmd" ]]; then
             BUFFER="# ${user_input}
 ${cmd}"
             CURSOR=${#BUFFER}
+            zle -M "[ai-ssh] 完成"
         else
             zle -M "[ai-ssh] 未能获取命令"
         fi
-        zle reset-prompt
+        zle redisplay
     }
     zle -N _aissh_generate_widget
     bindkey '^G' _aissh_generate_widget
@@ -316,22 +346,31 @@ ${cmd}"
     _aissh_buffer_widget() {
         local user_input="$BUFFER"
         if [[ -z "$user_input" ]]; then
+            local cmd=""
             if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
-                zle -R "[ai-ssh] 请在本地输入框中输入（含剪贴板）..."
-                local cmd; cmd="$(_aissh_local_prompt "true")"
-                if [[ -n "$cmd" ]]; then
-                    BUFFER="$cmd"
-                    CURSOR=${#BUFFER}
-                else
-                    zle -M "[ai-ssh] 已取消"
-                fi
-                zle reset-prompt
-                return
+                zle -M "[ai-ssh] 请在本地输入框中输入（含剪贴板）..."
+                cmd="$(_aissh_local_prompt "true")"
+            else
+                local native_input; native_input="$(_aissh_get_native_input "输入自然语言请求 (含剪贴板)")"
+                [[ -z "$native_input" ]] && { zle -M "[ai-ssh] 已取消"; zle redisplay; return; }
+                user_input="$native_input"
+                zle -M "[ai-ssh] 正在思考（含剪贴板）..."
+                local clipboard; clipboard="$(_aissh_get_clipboard)"
+                cmd="$(_aissh_call_ai "$user_input" "$clipboard")"
             fi
-            zle -M "[ai-ssh] 请先输入自然语言描述"
+
+            if [[ -n "$cmd" ]]; then
+                BUFFER="# ${user_input}
+${cmd}"
+                CURSOR=${#BUFFER}
+            else
+                zle -M "[ai-ssh] 未能获取命令"
+            fi
+            zle redisplay
             return
         fi
-        zle -R "[ai-ssh] 正在思考（含剪贴板）..."
+
+        zle -M "[ai-ssh] 正在思考（含剪贴板）..."
         
         local clipboard=""
         local fetch_local="false"
@@ -347,10 +386,11 @@ ${cmd}"
             BUFFER="# ${user_input}
 ${cmd}"
             CURSOR=${#BUFFER}
+            zle -M "[ai-ssh] 完成"
         else
             zle -M "[ai-ssh] 未能获取命令"
         fi
-        zle reset-prompt
+        zle redisplay
     }
     zle -N _aissh_buffer_widget
     bindkey '^B' _aissh_buffer_widget
@@ -364,17 +404,23 @@ elif [[ -n "${BASH_VERSION:-}" ]]; then
     _aissh_generate_bash() {
         local user_input="${READLINE_LINE}"
         if [[ -z "$user_input" ]]; then
+            local cmd=""
             if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
                 echo -ne "\r\033[K[ai-ssh] 请在本地输入框中输入..."
-                local cmd; cmd="$(_aissh_local_prompt)"
-                echo -ne "\r\033[K"
-                if [[ -n "$cmd" ]]; then
-                    READLINE_LINE="$cmd"
-                    READLINE_POINT=${#READLINE_LINE}
-                fi
-                return
+                cmd="$(_aissh_local_prompt)"
+            else
+                local native_input; native_input="$(_aissh_get_native_input)"
+                [[ -z "$native_input" ]] && { echo -ne "\r\033[K[ai-ssh] 已取消\n"; return; }
+                user_input="$native_input"
+                echo -ne "\r\033[K[ai-ssh] 正在思考..."
+                cmd="$(_aissh_call_ai "$user_input")"
             fi
-            echo "[ai-ssh] 请先输入自然语言描述"
+            echo -ne "\r\033[K"
+            if [[ -n "$cmd" ]]; then
+                READLINE_LINE="# ${user_input}
+${cmd}"
+                READLINE_POINT=${#READLINE_LINE}
+            fi
             return
         fi
         echo -ne "\r\033[K[ai-ssh] 正在思考..."
@@ -393,17 +439,24 @@ ${cmd}"
     _aissh_buffer_bash() {
         local user_input="${READLINE_LINE}"
         if [[ -z "$user_input" ]]; then
+            local cmd=""
             if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
                 echo -ne "\r\033[K[ai-ssh] 请在本地输入框中输入（含剪贴板）..."
-                local cmd; cmd="$(_aissh_local_prompt "true")"
-                echo -ne "\r\033[K"
-                if [[ -n "$cmd" ]]; then
-                    READLINE_LINE="$cmd"
-                    READLINE_POINT=${#READLINE_LINE}
-                fi
-                return
+                cmd="$(_aissh_local_prompt "true")"
+            else
+                local native_input; native_input="$(_aissh_get_native_input "输入自然语言请求 (含剪贴板)")"
+                [[ -z "$native_input" ]] && { echo -ne "\r\033[K[ai-ssh] 已取消\n"; return; }
+                user_input="$native_input"
+                echo -ne "\r\033[K[ai-ssh] 正在思考（含剪贴板）..."
+                local clipboard; clipboard="$(_aissh_get_clipboard)"
+                cmd="$(_aissh_call_ai "$user_input" "$clipboard")"
             fi
-            echo "[ai-ssh] 请先输入自然语言描述"
+            echo -ne "\r\033[K"
+            if [[ -n "$cmd" ]]; then
+                READLINE_LINE="# ${user_input}
+${cmd}"
+                READLINE_POINT=${#READLINE_LINE}
+            fi
             return
         fi
         echo -ne "\r\033[K[ai-ssh] 正在思考（含剪贴板）..."

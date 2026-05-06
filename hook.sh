@@ -428,3 +428,26 @@ ${cmd}"
     bind -x '"\C-b": _aissh_buffer_bash'
 
 fi
+
+# ─── 自动补全映射 (Inherit SSH Completion) ────────────────
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    # Zsh: 使用 compdef aissh=ssh 继承 ssh 的所有补全行为
+    # 这种方式比直接指定 _ssh 函数更可靠，因为它会自动寻找 ssh 绑定的函数
+    if command -v compdef &>/dev/null; then
+        compdef aissh=ssh 2>/dev/null || true
+    fi
+elif [[ -n "${BASH_VERSION:-}" ]]; then
+    # Bash: 尝试继承 ssh 的补全定义
+    if command -v complete &>/dev/null; then
+        _aissh_setup_bash_completion() {
+            local ssh_completion
+            ssh_completion=$(complete -p ssh 2>/dev/null || echo "")
+            if [[ -n "$ssh_completion" ]]; then
+                # 将 "complete ... ssh" 替换为 "complete ... aissh"
+                eval "${ssh_completion% ssh} aissh"
+            fi
+        }
+        # 延迟执行，确保 bash_completion 已加载
+        _aissh_setup_bash_completion 2>/dev/null || true
+    fi
+fi

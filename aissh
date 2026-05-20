@@ -8,12 +8,15 @@ set -euo pipefail
 
 AI_SSH_DIR="${HOME}/.ai-ssh"
 AI_SSH_CONFIG="${AI_SSH_DIR}/config"
-BRIDGE_PID_FILE="${AI_SSH_DIR}/bridge.pid"
-LOCAL_SOCK="${AI_SSH_DIR}/agent.sock"
-BRIDGE_LOG="${AI_SSH_DIR}/bridge.stderr.log"
+
+# ─── 动态会话配置（支持多窗口并发会话） ───────────────────────
+# 使用时间戳和 PID 生成动态随机后缀，防止并发会话时互相踩踏或强杀 Bridge
+AISSH_RAND="$(date +%s)-$$"
+BRIDGE_PID_FILE="${AI_SSH_DIR}/bridge-${AISSH_RAND}.pid"
+LOCAL_SOCK="${AI_SSH_DIR}/agent-${AISSH_RAND}.sock"
+BRIDGE_LOG="${AI_SSH_DIR}/bridge-${AISSH_RAND}.stderr.log"
 
 # ─── 智能定位 bridge.py ──────────────────────────────────
-# 优先使用安装目录，找不到回退到脚本所在目录（开发模式）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${AI_SSH_DIR}/bridge.py" ]]; then
     BRIDGE_SCRIPT="${AI_SSH_DIR}/bridge.py"
@@ -48,7 +51,7 @@ AI-SSH Wrapper — 自动为 SSH 会话附加 AI 辅助能力
 自动完成以下操作：
   1. 后台启动 Bridge 微服务 (Unix Socket + TCP)
   2. 建立反向隧道 (优先 Socket, 降级 TCP)
-  3. 在远程注入 Shell Hook（Ctrl+G / Ctrl+B）
+  3. 在远程注入 Shell Hook（Ctrl+G / Ctrl+B，支持 remote tmux 重连）
   4. SSH 退出时自动清理 Bridge
 
 示例:
@@ -65,7 +68,6 @@ USAGE
 
 # ─── 生成动态路径和端口 ──────────────────────────────────
 # 随机后缀避免 StreamLocalBindUnlink=no 导致的绑定冲突
-AISSH_RAND="$(date +%s)-$$"
 REMOTE_SOCK="/tmp/aissh-${AISSH_RAND}.sock"
 
 # TCP 降级端口：从 49152-65535 (动态端口范围) 中随机选一个
@@ -77,24 +79,30 @@ mkdir -p "$AI_SSH_DIR"
 
 # ─── 启动 Bridge ─────────────────────────────────────────
 _start_bridge() {
-    # 检查是否已有 Bridge 运行
-    if [[ -f "$BRIDGE_PID_FILE" ]]; then
-        local old_pid
-        old_pid=$(cat "$BRIDGE_PID_FILE")
-        if kill -0 "$old_pid" 2>/dev/null; then
-            _log "Bridge already running (PID=$old_pid), killing it for fresh start"
-            kill "$old_pid" 2>/dev/null || true
-            sleep 0.2
-            kill -9 "$old_pid" 2>/dev/null || true
+    # ─── 自愈机制：清理以往崩溃会话留下的失效 PID、Socket 与 Stderr 日志文件 ───
+    for pid_file in "${AI_SSH_DIR}"/bridge-*.pid; do
+        [[ -e "$pid_file" ]] || continue
+        local stale_pid
+        stale_pid=$(cat "$pid_file")
+        if ! kill -0 "$stale_pid" 2>/dev/null; then
+            _log "Cleaning up stale bridge PID file: $pid_file (process $stale_pid is dead)"
+            rm -f "$pid_file"
+            local sess_id="${pid_file##*/bridge-}"
+            sess_id="${sess_id%.pid}"
+            rm -f "${AI_SSH_DIR}/agent-${sess_id}.sock"
+            if [[ -f "${AI_SSH_DIR}/bridge-${sess_id}.stderr.log" ]]; then
+                rm -f "${AI_SSH_DIR}/bridge-${sess_id}.stderr.log"
+            fi
         fi
-    fi
+    done
 
-    # 清理残留 socket
+    # 针对当前会话的清理（以防万一）
     [[ -S "$LOCAL_SOCK" ]] && rm -f "$LOCAL_SOCK"
 
     _log "Starting Bridge (sock=${LOCAL_SOCK}, tcp=127.0.0.1:${TCP_PORT})..."
     _log "Bridge script: ${BRIDGE_SCRIPT}"
-    # stderr 写入日志文件，方便排错
+    
+    # stderr 写入专属日志文件，方便排错
     nohup python3 "$BRIDGE_SCRIPT" "$LOCAL_SOCK" --tcp-port "$TCP_PORT" > /dev/null 2>"$BRIDGE_LOG" &
     local bridge_pid=$!
     echo "$bridge_pid" > "$BRIDGE_PID_FILE"
@@ -141,6 +149,11 @@ _stop_bridge() {
         rm -f "$BRIDGE_PID_FILE"
     fi
     [[ -S "$LOCAL_SOCK" ]] && rm -f "$LOCAL_SOCK"
+    
+    # 如果未开启 VERBOSE 模式，退出时删除 stderr 日志，保持目录纯净
+    if [[ -f "$BRIDGE_LOG" ]] && [[ "$VERBOSE" != "true" ]]; then
+        rm -f "$BRIDGE_LOG"
+    fi
     _log "Bridge stopped"
 }
 
@@ -152,23 +165,43 @@ _build_remote_init() {
 export AI_SSH_REMOTE_SOCK="__REMOTE_SOCK__"
 export AI_SSH_TCP_PORT="__TCP_PORT__"
 
-# 智能发送：优先 Unix Socket 隧道，降级 TCP
+# 智能发送：优先 Unix Socket 隧道，降级 TCP (支持 Tmux 环境下的热插拔与重连)
 _aissh_send_request() {
     local json_payload="$1"
     local result=""
 
-    if [[ -S "${AI_SSH_REMOTE_SOCK}" ]]; then
-        result=$(curl -s --unix-socket "${AI_SSH_REMOTE_SOCK}" \
+    # Tmux 插拔支持：如果在 Tmux 会话中，实时向 tmux server 查询当前最新的 Socket 变量，确保重连后瞬间生效
+    local remote_sock="${AI_SSH_REMOTE_SOCK}"
+    local tcp_port="${AI_SSH_TCP_PORT}"
+    
+    if [[ -n "${TMUX:-}" ]] && command -v tmux &>/dev/null; then
+        local tmux_sock
+        tmux_sock=$(tmux show-environment AI_SSH_REMOTE_SOCK 2>/dev/null | cut -d= -f2)
+        [[ -z "$tmux_sock" ]] && tmux_sock=$(tmux show-environment -g AI_SSH_REMOTE_SOCK 2>/dev/null | cut -d= -f2)
+        if [[ -n "$tmux_sock" ]]; then
+            remote_sock="$tmux_sock"
+        fi
+        
+        local tmux_port
+        tmux_port=$(tmux show-environment AI_SSH_TCP_PORT 2>/dev/null | cut -d= -f2)
+        [[ -z "$tmux_port" ]] && tmux_port=$(tmux show-environment -g AI_SSH_TCP_PORT 2>/dev/null | cut -d= -f2)
+        if [[ -n "$tmux_port" ]]; then
+            tcp_port="$tmux_port"
+        fi
+    fi
+
+    if [[ -S "${remote_sock}" ]]; then
+        result=$(curl -s --unix-socket "${remote_sock}" \
             -X POST -H "Content-Type: application/json" \
             -d "$json_payload" \
             "http://localhost/generate" 2>/dev/null)
     fi
 
-    if [[ -z "$result" ]] && [[ -n "${AI_SSH_TCP_PORT}" ]]; then
+    if [[ -z "$result" ]] && [[ -n "${tcp_port}" ]]; then
         result=$(curl -s \
             -X POST -H "Content-Type: application/json" \
             -d "$json_payload" \
-            "http://127.0.0.1:${AI_SSH_TCP_PORT}/generate" 2>/dev/null)
+            "http://127.0.0.1:${tcp_port}/generate" 2>/dev/null)
     fi
     echo "$result"
 }
@@ -176,6 +209,17 @@ _aissh_send_request() {
 _aissh_remote_call() {
     local user_input="$1"
     local fetch_clipboard="${2:-false}"
+    
+    # 依赖前置检测：无 Python 或 curl 时优雅警告，不发生脚本崩坏
+    if ! command -v python3 &>/dev/null; then
+        echo "[ai-ssh] ERROR: python3 not found on remote host" >&2
+        return
+    fi
+    if ! command -v curl &>/dev/null; then
+        echo "[ai-ssh] ERROR: curl not found on remote host" >&2
+        return
+    fi
+
     local os_info; os_info="$(uname -a 2>/dev/null)"
     local pwd_info; pwd_info="$(pwd)"
     local env_info; env_info="PATH=${PATH}"
@@ -203,6 +247,17 @@ _aissh_remote_call() {
 # 🆕 本地输入模式：通过隧道让本地 Bridge 弹出原生对话框采集输入
 _aissh_local_prompt() {
     local fetch_clipboard="${1:-false}"
+    
+    # 依赖前置检测
+    if ! command -v python3 &>/dev/null; then
+        echo "[ai-ssh] ERROR: python3 not found on remote host" >&2
+        return
+    fi
+    if ! command -v curl &>/dev/null; then
+        echo "[ai-ssh] ERROR: curl not found on remote host" >&2
+        return
+    fi
+
     local os_info; os_info="$(uname -a 2>/dev/null)"
     local pwd_info; pwd_info="$(pwd)"
     local env_info; env_info="PATH=${PATH}"
@@ -322,29 +377,109 @@ ${c}"
     bind -x '"\C-g": _aissh_gen_b'
     bind -x '"\C-b": _aissh_buf_b'
 fi
+
+# ── Tmux 适配包 ──────────────────────────────────────────
+# 拦截 tmux 启动与窗口分屏指令，同步最新 Socket 变量，并为新建 window/pane 完美加载 AI 环境
+tmux() {
+    if [[ -n "${AI_SSH_REMOTE_SOCK:-}" ]]; then
+        local shell_name
+        shell_name=$(basename "${SHELL:-bash}")
+        local default_cmd=""
+        if [[ "$shell_name" == "zsh" ]] && [[ -n "${AI_SSH_ZDOTDIR:-}" ]]; then
+            default_cmd="ZDOTDIR=${AI_SSH_ZDOTDIR} zsh -i"
+        elif [[ "$shell_name" == "bash" ]] && [[ -n "${AI_SSH_RCFILE:-}" ]]; then
+            default_cmd="bash --rcfile ${AI_SSH_RCFILE} -i"
+        fi
+        
+        local is_session_cmd="false"
+        if [[ $# -eq 0 ]]; then
+            is_session_cmd="true"
+        elif [[ "$1" == "new" || "$1" == "new-session" || "$1" == "new-window" || "$1" == "split-window" || "$1" == "attach" || "$1" == "attach-session" || "$1" == "at" ]]; then
+            is_session_cmd="true"
+        fi
+        
+        if [[ "$is_session_cmd" == "true" ]]; then
+            if command -v tmux &>/dev/null; then
+                # 同步最新的隧道 Socket 和 Port 至 tmux 全局环境，确保旧 pane/window 能瞬间识别新隧道
+                command tmux set-environment -g AI_SSH_REMOTE_SOCK "${AI_SSH_REMOTE_SOCK}" 2>/dev/null || true
+                command tmux set-environment -g AI_SSH_TCP_PORT "${AI_SSH_TCP_PORT}" 2>/dev/null || true
+            fi
+            
+            if [[ -n "$default_cmd" ]]; then
+                if [[ $# -eq 0 ]]; then
+                    command tmux set-option -g default-command "$default_cmd" \; new-session
+                else
+                    command tmux set-option -g default-command "$default_cmd" \; "$@"
+                fi
+            else
+                command tmux "$@"
+            fi
+        else
+            command tmux "$@"
+        fi
+    else
+        command tmux "$@"
+    fi
+}
 # ── End AI-SSH Remote Hook ──────────────────────────────
 REMOTE_HOOK
 }
 
 # ─── 主逻辑 ──────────────────────────────────────────────
 
-# 1. 启动 Bridge (同时监听 Unix Socket + TCP)
+# 1. 解析参数以区分“交互式 Shell”与“单次非交互式命令”
+#    格式：aissh [options] [user@]hostname [command [args...]]
+has_command="false"
+host_found="false"
+args=("$@")
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+    arg="${args[i]}"
+    if [[ "$arg" =~ ^- ]]; then
+        case "$arg" in
+            -b|-c|-D|-E|-e|-F|-I|-i|-J|-L|-m|-O|-o|-p|-Q|-R|-S|-W|-w)
+                ((i+=2))
+                ;;
+            *)
+                ((i++))
+                ;;
+        esac
+    else
+        if [[ "$host_found" == "false" ]]; then
+            host_found="true"
+            ((i++))
+        else
+            has_command="true"
+            break
+        fi
+    fi
+done
+
+# 如果是非交互式命令（如 aissh user@host "uptime"），直接透传给原生 ssh，不做任何劫持与 Bridge 启动
+if [[ "$has_command" == "true" ]]; then
+    _log "Non-interactive command detected. Slicing through directly to standard ssh."
+    exec ssh "$@"
+fi
+
+# 2. 启动 Bridge (同时监听 Unix Socket + TCP)
 _start_bridge
 
-# 2. 设置清理 trap — SSH 退出时关闭 Bridge
+# 3. 设置清理 trap — 本地 SSH 退出时关闭 Bridge
 trap '_stop_bridge' EXIT INT TERM
 
-# 3. 构建远程初始化脚本，替换占位符
+# 4. 构建远程初始化脚本，替换占位符
 REMOTE_INIT=$(_build_remote_init | \
     sed "s|__REMOTE_SOCK__|${REMOTE_SOCK}|g" | \
     sed "s|__TCP_PORT__|${REMOTE_TCP_PORT}|g")
 
-# 4. Base64 编码远程脚本，避免 shell 引号嵌套问题
+# 5. Base64 编码远程脚本，避免 shell 引号嵌套问题
 REMOTE_INIT_B64=$(printf '%s' "$REMOTE_INIT" | base64 | tr -d '\n')
 
-# 5. 建立 SSH 连接
-#    流程：base64 解码 hook → 写入临时文件 → 通过 --rcfile 在交互式 shell 中 source
-#    这样 bind -x / zle 在交互式上下文中执行，热键才能生效
+# 6. 建立 SSH 连接，并注入远程环境
+#    设计亮点：
+#      - Zsh: 导出 ZDOTDIR=$_Z 以加载我们的定制配置，但在 .zshrc 首行立即还原 export ZDOTDIR=$HOME 保持与 Oh-My-Zsh / 插件 100% 兼容。
+#      - 换行保护：在 cat 用户原有 .zshrc 后，追加空行再 source hook 文件，预防尾部无换行符导致的语法报错。
+#      - 零残留：退出交互式 Shell 时，远程 EXIT 自动清理生成的 /tmp 临时脚本与目录。
 _log "Connecting SSH with tunnel: sock=${REMOTE_SOCK}, tcp=${REMOTE_TCP_PORT}"
 
 ssh \
@@ -354,6 +489,6 @@ ssh \
     -o "ExitOnForwardFailure=no" \
     -o "PermitLocalCommand=no" \
     "$@" \
-    "_F=/tmp/aissh-\$\$.sh; echo '${REMOTE_INIT_B64}' | base64 -d > \$_F; case \$(basename \${SHELL:-bash}) in zsh) _Z=\$(mktemp -d /tmp/aissh-zd-XXXXXX); { [ -f ~/.zshrc ] && cat ~/.zshrc; echo \". \$_F\"; } > \$_Z/.zshrc; ZDOTDIR=\$_Z exec zsh -i;; *) _R=/tmp/aissh-rc-\$\$.sh; printf '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n[ -f ~/.bashrc ] && . ~/.bashrc\n. %s\n' \$_F > \$_R; exec bash --rcfile \$_R -i;; esac"
+    "_F=/tmp/aissh-\$\$.sh; echo '${REMOTE_INIT_B64}' | base64 -d > \$_F; case \$(basename \${SHELL:-bash}) in zsh) _Z=\$(mktemp -d /tmp/aissh-zd-XXXXXX); { echo \"export ZDOTDIR=\\\$HOME\"; echo \"export AI_SSH_ZDOTDIR=\$_Z\"; [ -f ~/.zshrc ] && cat ~/.zshrc; echo \"\"; echo \". \$_F\"; echo \"trap 'rm -rf \$_F \$_Z' EXIT\"; } > \$_Z/.zshrc; ZDOTDIR=\$_Z exec zsh -i;; *) _R=/tmp/aissh-rc-\$\$.sh; printf 'export AI_SSH_RCFILE=\"%s\"\n[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n[ -f ~/.bashrc ] && . ~/.bashrc\n. %s\ntrap \"rm -f %s %s\" EXIT\n' \$_R \$_F \$_F \$_R > \$_R; exec bash --rcfile \$_R -i;; esac"
 
 _log "SSH session ended"

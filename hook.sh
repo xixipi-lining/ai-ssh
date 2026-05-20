@@ -485,9 +485,21 @@ fi
 # ─── 自动补全映射 (Inherit SSH Completion) ────────────────
 if [[ -n "${ZSH_VERSION:-}" ]]; then
     # Zsh: 使用 compdef aissh=ssh 继承 ssh 的所有补全行为
-    # 这种方式比直接指定 _ssh 函数更可靠，因为它会自动寻找 ssh 绑定的函数
-    if command -v compdef &>/dev/null; then
+    # 动态检测: 如果 compinit 还没运行 (即 compdef 未定义)，注册一个 precmd 钩子延迟加载
+    if (( $+functions[compdef] )); then
         compdef aissh=ssh 2>/dev/null || true
+    else
+        _aissh_setup_compdef() {
+            if (( $+functions[compdef] )); then
+                compdef aissh=ssh 2>/dev/null || true
+                # 绑定成功后卸载 precmd 钩子，避免持续消耗性能
+                add-zsh-hook -d precmd _aissh_setup_compdef
+            fi
+        }
+        # 尝试加载 add-zsh-hook 并注册延迟绑定
+        if autoload -Uz add-zsh-hook 2>/dev/null; then
+            add-zsh-hook precmd _aissh_setup_compdef
+        fi
     fi
 elif [[ -n "${BASH_VERSION:-}" ]]; then
     # Bash: 尝试继承 ssh 的补全定义
